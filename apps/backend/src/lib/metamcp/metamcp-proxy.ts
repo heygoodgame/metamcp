@@ -38,6 +38,56 @@ import {
 } from "./metamcp-middleware/functional-middleware";
 import { sanitizeName } from "./utils";
 
+/**
+ * Enhanced session acquisition with retry logic and exponential backoff
+ */
+async function getSessionWithRetry(
+  sessionId: string,
+  serverUuid: string,
+  params: ServerParameters,
+  maxRetries: number = 3,
+  baseDelay: number = 100,
+): Promise<ConnectedClient | undefined> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const session = await mcpServerPool.getSession(sessionId, serverUuid, params);
+      if (session) {
+        return session;
+      }
+      
+      if (attempt === maxRetries) {
+        console.error(
+          `Failed to acquire session for server ${serverUuid} after ${maxRetries} attempts`,
+        );
+        return undefined;
+      }
+      
+      // Exponential backoff
+      const delay = baseDelay * Math.pow(2, attempt - 1);
+      console.log(
+        `Session acquisition failed for server ${serverUuid}, retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`,
+      );
+      await new Promise(resolve => setTimeout(resolve, delay));
+      
+    } catch (error) {
+      console.error(
+        `Error during session acquisition for server ${serverUuid} (attempt ${attempt}/${maxRetries}):`,
+        error,
+      );
+      
+      if (attempt === maxRetries) {
+        return undefined;
+      }
+      
+      // Exponential backoff for errors too
+      const delay = baseDelay * Math.pow(2, attempt - 1);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  return undefined;
+}
+
 export const createServer = async (
   namespaceUuid: string,
   sessionId: string,
@@ -90,11 +140,19 @@ export const createServer = async (
     request,
     context,
   ) => {
+    const startTime = Date.now();
     const serverParams = await getMcpServers(
       context.namespaceUuid,
       includeInactiveServers,
     );
     const allTools: Tool[] = [];
+    const serverMetrics = {
+      total: 0,
+      successful: 0,
+      failed: 0,
+      skipped: 0,
+      toolsRetrieved: 0,
+    };
 
     // Warmup the namespace to pre-create idle sessions and reduce race conditions
     try {
@@ -106,21 +164,35 @@ export const createServer = async (
       );
     }
 
+    // Log pool metrics for monitoring
+    const poolMetrics = mcpServerPool.getPoolMetrics();
+    console.log(
+      `Pool metrics for namespace ${context.namespaceUuid}: idle=${poolMetrics.totalIdle}, active=${poolMetrics.totalActive}, reserved=${poolMetrics.totalReserved}, creating=${poolMetrics.totalCreating}`,
+    );
+
     // We'll filter servers during processing after getting sessions to check actual MCP server names
     const allServerEntries = Object.entries(serverParams);
+    serverMetrics.total = allServerEntries.length;
 
     await Promise.allSettled(
       allServerEntries.map(async ([mcpServerUuid, params]) => {
         // Skip if we've already visited this server to prevent circular references
         if (visitedServers.has(mcpServerUuid)) {
+          serverMetrics.skipped++;
           return;
         }
-        const session = await mcpServerPool.getSession(
+        const session = await getSessionWithRetry(
           context.sessionId,
           mcpServerUuid,
           params,
         );
-        if (!session) return;
+        if (!session) {
+          console.warn(
+            `Failed to get session for server ${mcpServerUuid} (${params.name}), skipping tools from this server`,
+          );
+          serverMetrics.failed++;
+          return;
+        }
 
         // Now check for self-referencing using the actual MCP server name
         const serverVersion = session.client.getServerVersion();
@@ -131,11 +203,13 @@ export const createServer = async (
           console.log(
             `Skipping self-referencing MetaMCP server: "${actualServerName}"`,
           );
+          serverMetrics.skipped++;
           return;
         }
 
         // Check basic self-reference patterns
         if (isSameServerInstance(params, mcpServerUuid)) {
+          serverMetrics.skipped++;
           return;
         }
 
@@ -143,7 +217,10 @@ export const createServer = async (
         visitedServers.add(mcpServerUuid);
 
         const capabilities = session.client.getServerCapabilities();
-        if (!capabilities?.tools) return;
+        if (!capabilities?.tools) {
+          serverMetrics.skipped++;
+          return;
+        }
 
         // Use name assigned by user, fallback to name from server
         const serverName =
@@ -187,11 +264,41 @@ export const createServer = async (
             }) || [];
 
           allTools.push(...toolsWithSource);
+          serverMetrics.successful++;
+          serverMetrics.toolsRetrieved += toolsWithSource.length;
         } catch (error) {
           console.error(`Error fetching tools from: ${serverName}`, error);
+          serverMetrics.failed++;
         }
       }),
     );
+
+    const duration = Date.now() - startTime;
+    
+    // Log comprehensive metrics for monitoring
+    console.log(
+      `Tools/list completed for namespace ${context.namespaceUuid} in ${duration}ms:`,
+      `servers=${serverMetrics.total}, successful=${serverMetrics.successful}, failed=${serverMetrics.failed}, skipped=${serverMetrics.skipped},`,
+      `tools=${serverMetrics.toolsRetrieved}, sessionId=${context.sessionId}`,
+    );
+
+    // Log warning if we have significant failures
+    if (serverMetrics.failed > 0 && serverMetrics.failed / serverMetrics.total > 0.2) {
+      console.warn(
+        `High failure rate for namespace ${context.namespaceUuid}: ${serverMetrics.failed}/${serverMetrics.total} servers failed (${Math.round((serverMetrics.failed / serverMetrics.total) * 100)}%)`,
+      );
+    }
+
+    // Graceful degradation: return what tools we could retrieve, even if some servers failed
+    if (serverMetrics.failed > 0 && allTools.length === 0) {
+      console.error(
+        `All servers failed for namespace ${context.namespaceUuid}, returning empty tools list`,
+      );
+    } else if (serverMetrics.failed > 0) {
+      console.warn(
+        `Partial success for namespace ${context.namespaceUuid}: ${allTools.length} tools retrieved despite ${serverMetrics.failed} server failures`,
+      );
+    }
 
     return { tools: allTools };
   };

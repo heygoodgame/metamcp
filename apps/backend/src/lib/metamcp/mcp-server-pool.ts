@@ -9,12 +9,34 @@ export interface McpServerPoolStatus {
   idleServerUuids: string[];
 }
 
+export interface SessionReservation {
+  reservedAt: number;
+  sessionId: string;
+  client: ConnectedClient;
+}
+
+export interface SessionPoolMetrics {
+  totalIdle: number;
+  totalActive: number;
+  totalReserved: number;
+  totalCreating: number;
+  servers: Record<string, {
+    idle: number;
+    active: number;
+    reserved: number;
+    creating: boolean;
+  }>;
+}
+
 export class McpServerPool {
   // Singleton instance
   private static instance: McpServerPool | null = null;
 
-  // Idle sessions: serverUuid -> ConnectedClient (no sessionId assigned yet)
-  private idleSessions: Record<string, ConnectedClient> = {};
+  // Idle sessions: serverUuid -> ConnectedClient[] (pool of available sessions)
+  private idleSessions: Record<string, ConnectedClient[]> = {};
+
+  // Reserved sessions: serverUuid -> SessionReservation[] (temporarily held sessions)
+  private reservedSessions: Record<string, SessionReservation[]> = {};
 
   // Active sessions: sessionId -> Record<serverUuid, ConnectedClient>
   private activeSessions: Record<string, Record<string, ConnectedClient>> = {};
@@ -31,14 +53,64 @@ export class McpServerPool {
   // Track promises for ongoing session creation: serverUuid -> Promise<ConnectedClient | undefined>
   private creatingSessionPromises: Map<string, Promise<ConnectedClient | undefined>> = new Map();
 
+  // Waiting queues for sessions: serverUuid -> Array of resolve functions
+  private waitingQueues: Map<string, Array<(client: ConnectedClient | null) => void>> = new Map();
+
   // Default number of idle sessions per server UUID
   private readonly defaultIdleCount: number;
+
+  // Minimum pool size per server (always maintain this many idle sessions)
+  private readonly minPoolSize: number = 2;
 
   // Default timeout for waiting for session creation (30 seconds)
   private readonly SESSION_CREATION_TIMEOUT = 30000;
 
+  // Reservation timeout (5 seconds)
+  private readonly RESERVATION_TIMEOUT = 5000;
+
+  // Session waiting poll interval (100ms)
+  private readonly WAIT_POLL_INTERVAL = 100;
+
   private constructor(defaultIdleCount: number = 1) {
     this.defaultIdleCount = defaultIdleCount;
+    
+    // Start cleanup timer for expired reservations
+    this.startReservationCleanupTimer();
+  }
+
+  /**
+   * Start periodic cleanup of expired reservations
+   */
+  private startReservationCleanupTimer(): void {
+    setInterval(() => {
+      this.cleanupExpiredReservations();
+    }, this.RESERVATION_TIMEOUT);
+  }
+
+  /**
+   * Clean up expired session reservations
+   */
+  private cleanupExpiredReservations(): void {
+    const now = Date.now();
+    
+    Object.entries(this.reservedSessions).forEach(([serverUuid, reservations]) => {
+      const validReservations = reservations.filter(reservation => {
+        const isExpired = now - reservation.reservedAt > this.RESERVATION_TIMEOUT;
+        if (isExpired) {
+          // Return expired reservation back to idle pool
+          if (!this.idleSessions[serverUuid]) {
+            this.idleSessions[serverUuid] = [];
+          }
+          this.idleSessions[serverUuid].push(reservation.client);
+          console.log(
+            `Released expired reservation for server ${serverUuid}, session ${reservation.sessionId}`,
+          );
+        }
+        return !isExpired;
+      });
+      
+      this.reservedSessions[serverUuid] = validReservations;
+    });
   }
 
   /**
@@ -52,7 +124,7 @@ export class McpServerPool {
   }
 
   /**
-   * Get or create a session for a specific MCP server
+   * Get or create a session for a specific MCP server with enhanced race condition protection
    */
   async getSession(
     sessionId: string,
@@ -67,91 +139,181 @@ export class McpServerPool {
       return this.activeSessions[sessionId][serverUuid];
     }
 
-    // Initialize session if it doesn't exist
+    // Initialize session tracking if it doesn't exist
     if (!this.activeSessions[sessionId]) {
       this.activeSessions[sessionId] = {};
       this.sessionToServers[sessionId] = new Set();
     }
 
-    // Check if we have an idle session for this server that we can convert
-    const idleClient = this.idleSessions[serverUuid];
-    if (idleClient) {
-      // Convert idle session to active session
-      delete this.idleSessions[serverUuid];
-      this.activeSessions[sessionId][serverUuid] = idleClient;
+    // Try to get a session with reservation system (prevents race conditions)
+    const client = await this.getOrWaitForSession(sessionId, serverUuid, params);
+    
+    if (client) {
+      // Successfully got a session, convert to active
+      this.activeSessions[sessionId][serverUuid] = client;
       this.sessionToServers[sessionId].add(serverUuid);
-
+      
       console.log(
-        `Converted idle session to active for server ${serverUuid}, session ${sessionId}`,
-      );
-
-      // Create a new idle session to replace the one we just used (ASYNC - NON-BLOCKING)
-      this.createIdleSessionAsync(serverUuid, params);
-
-      return idleClient;
-    }
-
-    // Check if a session is currently being created for this server
-    if (this.creatingIdleSessions.has(serverUuid)) {
-      console.log(
-        `Waiting for idle session creation for server ${serverUuid}, session ${sessionId}`,
+        `Acquired session for server ${serverUuid}, session ${sessionId}`,
       );
       
-      // Wait for the existing creation promise with timeout
-      const existingPromise = this.creatingSessionPromises.get(serverUuid);
-      if (existingPromise) {
-        try {
-          const client = await this.waitWithTimeout(
-            existingPromise,
-            this.SESSION_CREATION_TIMEOUT,
-            `Session creation timeout for server ${serverUuid}`,
-          );
-          
-          if (client) {
-            // Check again if we now have an idle session
-            const idleClientAfterWait = this.idleSessions[serverUuid];
-            if (idleClientAfterWait) {
-              // Convert idle session to active session
-              delete this.idleSessions[serverUuid];
-              this.activeSessions[sessionId][serverUuid] = idleClientAfterWait;
-              this.sessionToServers[sessionId].add(serverUuid);
+      // Ensure minimum pool size is maintained
+      this.ensureMinimumPoolSize(serverUuid, params);
+      
+      return client;
+    }
 
-              console.log(
-                `Converted newly created idle session to active for server ${serverUuid}, session ${sessionId}`,
-              );
+    console.error(
+      `Failed to acquire session for server ${serverUuid}, session ${sessionId}`,
+    );
+    return undefined;
+  }
 
-              // Create a new idle session to replace the one we just used
-              this.createIdleSessionAsync(serverUuid, params);
+  /**
+   * Get or wait for a session with comprehensive race condition protection
+   */
+  private async getOrWaitForSession(
+    sessionId: string,
+    serverUuid: string,
+    params: ServerParameters,
+  ): Promise<ConnectedClient | undefined> {
+    // Try to reserve an idle session immediately
+    const reservedClient = this.tryReserveIdleSession(sessionId, serverUuid);
+    if (reservedClient) {
+      return reservedClient;
+    }
 
-              return idleClientAfterWait;
-            }
-          }
-        } catch (error) {
-          console.error(
-            `Error waiting for idle session creation for server ${serverUuid}:`,
-            error,
-          );
-        }
+    // No idle session available, check if we're creating one
+    if (this.creatingIdleSessions.has(serverUuid)) {
+      console.log(
+        `Waiting for session creation for server ${serverUuid}, session ${sessionId}`,
+      );
+      
+      // Wait for the session to be created
+      const client = await this.waitForSessionCreation(serverUuid);
+      if (client) {
+        return client;
       }
     }
 
-    // No idle session available and none being created, create a new connection
+    // No session available and none being created, create one synchronously
+    console.log(
+      `Creating new session for server ${serverUuid}, session ${sessionId}`,
+    );
+    
     const newClient = await this.createNewConnection(params);
-    if (!newClient) {
+    if (newClient) {
+      console.log(
+        `Created new session for server ${serverUuid}, session ${sessionId}`,
+      );
+    }
+    
+    return newClient;
+  }
+
+  /**
+   * Try to reserve an idle session atomically
+   */
+  private tryReserveIdleSession(
+    sessionId: string,
+    serverUuid: string,
+  ): ConnectedClient | undefined {
+    const idlePool = this.idleSessions[serverUuid];
+    if (!idlePool || idlePool.length === 0) {
       return undefined;
     }
 
-    this.activeSessions[sessionId][serverUuid] = newClient;
-    this.sessionToServers[sessionId].add(serverUuid);
+    // Atomically remove from idle pool and add to reservations
+    const client = idlePool.pop()!;
+    
+    if (!this.reservedSessions[serverUuid]) {
+      this.reservedSessions[serverUuid] = [];
+    }
+    
+    this.reservedSessions[serverUuid].push({
+      reservedAt: Date.now(),
+      sessionId,
+      client,
+    });
 
     console.log(
-      `Created new active session for server ${serverUuid}, session ${sessionId}`,
+      `Reserved idle session for server ${serverUuid}, session ${sessionId}`,
     );
 
-    // Also create an idle session for future use (ASYNC - NON-BLOCKING)
-    this.createIdleSessionAsync(serverUuid, params);
+    return client;
+  }
 
-    return newClient;
+  /**
+   * Wait for session creation with exponential backoff and timeout
+   */
+  private async waitForSessionCreation(
+    serverUuid: string,
+  ): Promise<ConnectedClient | undefined> {
+    return new Promise((resolve) => {
+      const startTime = Date.now();
+      let attempts = 0;
+      const maxAttempts = Math.ceil(this.SESSION_CREATION_TIMEOUT / this.WAIT_POLL_INTERVAL);
+
+      const checkForSession = () => {
+        attempts++;
+        const elapsed = Date.now() - startTime;
+
+        // Check if timeout exceeded
+        if (elapsed > this.SESSION_CREATION_TIMEOUT || attempts > maxAttempts) {
+          console.warn(
+            `Session wait timeout for server ${serverUuid} after ${elapsed}ms`,
+          );
+          resolve(undefined);
+          return;
+        }
+
+        // Check if session is no longer being created (creation completed or failed)
+        if (!this.creatingIdleSessions.has(serverUuid)) {
+          // Try to reserve a newly created session
+          const idlePool = this.idleSessions[serverUuid];
+          if (idlePool && idlePool.length > 0) {
+            const client = idlePool.pop()!;
+            console.log(
+              `Got newly created session for server ${serverUuid} after ${elapsed}ms`,
+            );
+            resolve(client);
+            return;
+          }
+        }
+
+        // Calculate next wait interval with exponential backoff (cap at 1000ms)
+        const backoffInterval = Math.min(
+          this.WAIT_POLL_INTERVAL * Math.pow(1.2, Math.floor(attempts / 5)),
+          1000,
+        );
+
+        setTimeout(checkForSession, backoffInterval);
+      };
+
+      // Start checking
+      checkForSession();
+    });
+  }
+
+  /**
+   * Ensure minimum pool size is maintained for a server
+   */
+  private ensureMinimumPoolSize(
+    serverUuid: string,
+    params: ServerParameters,
+  ): void {
+    const currentPoolSize = (this.idleSessions[serverUuid]?.length || 0);
+    const neededSessions = this.minPoolSize - currentPoolSize;
+    
+    if (neededSessions > 0 && !this.creatingIdleSessions.has(serverUuid)) {
+      console.log(
+        `Creating ${neededSessions} sessions to maintain minimum pool size for server ${serverUuid}`,
+      );
+      
+      for (let i = 0; i < neededSessions; i++) {
+        this.createIdleSessionAsync(serverUuid, params);
+      }
+    }
   }
 
   /**
@@ -175,15 +337,13 @@ export class McpServerPool {
     serverUuid: string,
     params: ServerParameters,
   ): Promise<void> {
-    // Don't create if we already have an idle session for this server
-    if (this.idleSessions[serverUuid]) {
-      return;
-    }
-
     const newClient = await this.createNewConnection(params);
     if (newClient) {
-      this.idleSessions[serverUuid] = newClient;
-      console.log(`Created idle session for server ${serverUuid}`);
+      if (!this.idleSessions[serverUuid]) {
+        this.idleSessions[serverUuid] = [];
+      }
+      this.idleSessions[serverUuid].push(newClient);
+      console.log(`Created idle session for server ${serverUuid} (pool size: ${this.idleSessions[serverUuid].length})`);
     }
   }
 
@@ -214,11 +374,8 @@ export class McpServerPool {
     serverUuid: string,
     params: ServerParameters,
   ): void {
-    // Don't create if we already have an idle session or are already creating one
-    if (
-      this.idleSessions[serverUuid] ||
-      this.creatingIdleSessions.has(serverUuid)
-    ) {
+    // Don't create if we're already creating one (allow multiple idle sessions)
+    if (this.creatingIdleSessions.has(serverUuid)) {
       return;
     }
 
@@ -228,20 +385,19 @@ export class McpServerPool {
     // Create the session promise and store it
     const creationPromise = this.createNewConnection(params)
       .then((newClient) => {
-        if (newClient && !this.idleSessions[serverUuid]) {
-          this.idleSessions[serverUuid] = newClient;
+        if (newClient) {
+          if (!this.idleSessions[serverUuid]) {
+            this.idleSessions[serverUuid] = [];
+          }
+          this.idleSessions[serverUuid].push(newClient);
           console.log(
-            `Created background idle session for server [${params.name}] ${serverUuid}`,
+            `Created background idle session for server [${params.name}] ${serverUuid} (pool size: ${this.idleSessions[serverUuid].length})`,
           );
+          
+          // Notify any waiting sessions
+          this.notifyWaitingQueue(serverUuid, newClient);
+          
           return newClient;
-        } else if (newClient) {
-          // We already have an idle session, cleanup the extra one
-          newClient.cleanup().catch((error) => {
-            console.error(
-              `Error cleaning up extra idle session for ${serverUuid}:`,
-              error,
-            );
-          });
         }
         return undefined;
       })
@@ -250,6 +406,10 @@ export class McpServerPool {
           `Error creating background idle session for ${serverUuid}:`,
           error,
         );
+        
+        // Notify waiting queue about the failure
+        this.notifyWaitingQueue(serverUuid, null);
+        
         return undefined;
       })
       .finally(() => {
@@ -263,14 +423,36 @@ export class McpServerPool {
   }
 
   /**
-   * Ensure idle sessions exist for all servers
+   * Notify waiting queue when a session is available
+   */
+  private notifyWaitingQueue(
+    serverUuid: string,
+    client: ConnectedClient | null,
+  ): void {
+    const queue = this.waitingQueues.get(serverUuid);
+    if (queue && queue.length > 0) {
+      const waiter = queue.shift();
+      if (waiter) {
+        waiter(client);
+        console.log(
+          `Notified waiting queue for server ${serverUuid} (${queue.length} remaining)`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Ensure idle sessions exist for all servers (maintains minimum pool size)
    */
   async ensureIdleSessions(
     serverParams: Record<string, ServerParameters>,
   ): Promise<void> {
     const promises = Object.entries(serverParams).map(
       async ([uuid, params]) => {
-        if (!this.idleSessions[uuid]) {
+        const currentPoolSize = this.idleSessions[uuid]?.length || 0;
+        const neededSessions = this.minPoolSize - currentPoolSize;
+        
+        for (let i = 0; i < neededSessions; i++) {
           await this.createIdleSession(uuid, params);
         }
       },
@@ -293,14 +475,19 @@ export class McpServerPool {
     const startTime = Date.now();
     const promises = Object.entries(serverParams).map(
       async ([uuid, params]) => {
-        // Check if we already have an idle session or are creating one
-        if (this.idleSessions[uuid] || this.creatingIdleSessions.has(uuid)) {
+        const currentPoolSize = this.idleSessions[uuid]?.length || 0;
+        const neededSessions = this.minPoolSize - currentPoolSize;
+        
+        // Only create if we need more sessions
+        if (neededSessions <= 0) {
           return;
         }
 
         try {
-          // Create idle session synchronously for warmup
-          await this.createIdleSession(uuid, params);
+          // Create minimum pool size for warmup
+          for (let i = 0; i < neededSessions; i++) {
+            await this.createIdleSession(uuid, params);
+          }
         } catch (error) {
           console.error(
             `Failed to warmup server ${uuid} (${params.name}):`,
@@ -318,6 +505,62 @@ export class McpServerPool {
     console.log(
       `Namespace warmup completed in ${duration}ms: ${successCount} successful, ${failCount} failed`,
     );
+  }
+
+  /**
+   * Get current pool metrics for monitoring
+   */
+  getPoolMetrics(): SessionPoolMetrics {
+    const servers: Record<string, { idle: number; active: number; reserved: number; creating: boolean }> = {};
+    let totalIdle = 0;
+    let totalActive = 0;
+    let totalReserved = 0;
+    let totalCreating = 0;
+
+    // Calculate idle sessions
+    Object.entries(this.idleSessions).forEach(([serverUuid, sessions]) => {
+      const idleCount = sessions.length;
+      totalIdle += idleCount;
+      servers[serverUuid] = { idle: idleCount, active: 0, reserved: 0, creating: false };
+    });
+
+    // Calculate active sessions
+    Object.values(this.activeSessions).forEach(sessionServers => {
+      Object.keys(sessionServers).forEach(serverUuid => {
+        totalActive++;
+        if (!servers[serverUuid]) {
+          servers[serverUuid] = { idle: 0, active: 0, reserved: 0, creating: false };
+        }
+        servers[serverUuid].active++;
+      });
+    });
+
+    // Calculate reserved sessions
+    Object.entries(this.reservedSessions).forEach(([serverUuid, reservations]) => {
+      const reservedCount = reservations.length;
+      totalReserved += reservedCount;
+      if (!servers[serverUuid]) {
+        servers[serverUuid] = { idle: 0, active: 0, reserved: 0, creating: false };
+      }
+      servers[serverUuid].reserved = reservedCount;
+    });
+
+    // Mark creating sessions
+    this.creatingIdleSessions.forEach(serverUuid => {
+      totalCreating++;
+      if (!servers[serverUuid]) {
+        servers[serverUuid] = { idle: 0, active: 0, reserved: 0, creating: false };
+      }
+      servers[serverUuid].creating = true;
+    });
+
+    return {
+      totalIdle,
+      totalActive,
+      totalReserved,
+      totalCreating,
+      servers,
+    };
   }
 
   /**
@@ -368,26 +611,36 @@ export class McpServerPool {
 
     // Cleanup all idle sessions
     await Promise.allSettled(
-      Object.entries(this.idleSessions).map(async ([_uuid, client]) => {
-        await client.cleanup();
-      }),
+      Object.entries(this.idleSessions).flatMap(([_uuid, clients]) =>
+        clients.map(client => client.cleanup())
+      ),
+    );
+
+    // Cleanup all reserved sessions
+    await Promise.allSettled(
+      Object.entries(this.reservedSessions).flatMap(([_uuid, reservations]) =>
+        reservations.map(reservation => reservation.client.cleanup())
+      ),
     );
 
     // Clear all state
     this.idleSessions = {};
+    this.reservedSessions = {};
     this.activeSessions = {};
     this.sessionToServers = {};
     this.serverParamsCache = {};
     this.creatingIdleSessions.clear();
+    this.creatingSessionPromises.clear();
+    this.waitingQueues.clear();
 
     console.log("Cleaned up all MCP server pool sessions");
   }
 
   /**
-   * Get pool status for monitoring
+   * Get pool status for monitoring (legacy method - use getPoolMetrics for detailed info)
    */
   getPoolStatus(): McpServerPoolStatus {
-    const idle = Object.keys(this.idleSessions).length;
+    const idle = Object.values(this.idleSessions).reduce((total, clients) => total + clients.length, 0);
     const active = Object.keys(this.activeSessions).reduce(
       (total, sessionId) =>
         total + Object.keys(this.activeSessions[sessionId]).length,
@@ -400,6 +653,119 @@ export class McpServerPool {
       activeSessionIds: Object.keys(this.activeSessions),
       idleServerUuids: Object.keys(this.idleSessions),
     };
+  }
+
+  /**
+   * Stress test the session pool to verify race condition fixes
+   */
+  async stressTest(
+    serverParams: Record<string, ServerParameters>,
+    concurrentRequests: number = 10,
+    iterations: number = 5,
+  ): Promise<{
+    totalRequests: number;
+    successfulRequests: number;
+    failedRequests: number;
+    averageResponseTime: number;
+    raceConditionsDetected: number;
+  }> {
+    console.log(
+      `Starting stress test: ${concurrentRequests} concurrent requests, ${iterations} iterations`,
+    );
+
+    let totalRequests = 0;
+    let successfulRequests = 0;
+    let failedRequests = 0;
+    let totalResponseTime = 0;
+    let raceConditionsDetected = 0;
+
+    for (let iteration = 0; iteration < iterations; iteration++) {
+      console.log(`Stress test iteration ${iteration + 1}/${iterations}`);
+
+      const promises = Array.from({ length: concurrentRequests }, async (_, requestIndex) => {
+        const startTime = Date.now();
+        const sessionId = `stress-test-session-${iteration}-${requestIndex}`;
+        const serverEntries = Object.entries(serverParams);
+        
+        let requestSuccessful = true;
+        let requestSessions = 0;
+
+        for (const [serverUuid, params] of serverEntries) {
+          try {
+            const session = await this.getSession(sessionId, serverUuid, params);
+            if (session) {
+              requestSessions++;
+            } else {
+              console.warn(`Stress test: Failed to get session for ${serverUuid}`);
+              requestSuccessful = false;
+            }
+          } catch (error) {
+            console.error(`Stress test: Error getting session for ${serverUuid}:`, error);
+            requestSuccessful = false;
+          }
+        }
+
+        const responseTime = Date.now() - startTime;
+        totalResponseTime += responseTime;
+
+        // Check for potential race conditions (empty sessions when we expect them)
+        if (requestSessions === 0 && serverEntries.length > 0) {
+          raceConditionsDetected++;
+          console.warn(
+            `Potential race condition detected: No sessions acquired for ${sessionId}`,
+          );
+        }
+
+        return {
+          successful: requestSuccessful,
+          responseTime,
+          sessionId,
+          sessionsAcquired: requestSessions,
+        };
+      });
+
+      const results = await Promise.allSettled(promises);
+      
+      results.forEach((result) => {
+        totalRequests++;
+        if (result.status === 'fulfilled') {
+          if (result.value.successful) {
+            successfulRequests++;
+          } else {
+            failedRequests++;
+          }
+        } else {
+          failedRequests++;
+          console.error('Stress test promise failed:', result.reason);
+        }
+      });
+
+      // Cleanup sessions from this iteration
+      for (let requestIndex = 0; requestIndex < concurrentRequests; requestIndex++) {
+        const sessionId = `stress-test-session-${iteration}-${requestIndex}`;
+        try {
+          await this.cleanupSession(sessionId);
+        } catch (error) {
+          console.error(`Failed to cleanup session ${sessionId}:`, error);
+        }
+      }
+
+      // Small delay between iterations
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    const averageResponseTime = totalResponseTime / totalRequests;
+
+    const results = {
+      totalRequests,
+      successfulRequests,
+      failedRequests,
+      averageResponseTime,
+      raceConditionsDetected,
+    };
+
+    console.log('Stress test completed:', results);
+    return results;
   }
 
   /**
