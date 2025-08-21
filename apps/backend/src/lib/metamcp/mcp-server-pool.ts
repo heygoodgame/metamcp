@@ -28,8 +28,14 @@ export class McpServerPool {
   // Track ongoing idle session creation to prevent duplicates
   private creatingIdleSessions: Set<string> = new Set();
 
+  // Track promises for ongoing session creation: serverUuid -> Promise<ConnectedClient | undefined>
+  private creatingSessionPromises: Map<string, Promise<ConnectedClient | undefined>> = new Map();
+
   // Default number of idle sessions per server UUID
   private readonly defaultIdleCount: number;
+
+  // Default timeout for waiting for session creation (30 seconds)
+  private readonly SESSION_CREATION_TIMEOUT = 30000;
 
   private constructor(defaultIdleCount: number = 1) {
     this.defaultIdleCount = defaultIdleCount;
@@ -85,7 +91,51 @@ export class McpServerPool {
       return idleClient;
     }
 
-    // No idle session available, create a new connection
+    // Check if a session is currently being created for this server
+    if (this.creatingIdleSessions.has(serverUuid)) {
+      console.log(
+        `Waiting for idle session creation for server ${serverUuid}, session ${sessionId}`,
+      );
+      
+      // Wait for the existing creation promise with timeout
+      const existingPromise = this.creatingSessionPromises.get(serverUuid);
+      if (existingPromise) {
+        try {
+          const client = await this.waitWithTimeout(
+            existingPromise,
+            this.SESSION_CREATION_TIMEOUT,
+            `Session creation timeout for server ${serverUuid}`,
+          );
+          
+          if (client) {
+            // Check again if we now have an idle session
+            const idleClientAfterWait = this.idleSessions[serverUuid];
+            if (idleClientAfterWait) {
+              // Convert idle session to active session
+              delete this.idleSessions[serverUuid];
+              this.activeSessions[sessionId][serverUuid] = idleClientAfterWait;
+              this.sessionToServers[sessionId].add(serverUuid);
+
+              console.log(
+                `Converted newly created idle session to active for server ${serverUuid}, session ${sessionId}`,
+              );
+
+              // Create a new idle session to replace the one we just used
+              this.createIdleSessionAsync(serverUuid, params);
+
+              return idleClientAfterWait;
+            }
+          }
+        } catch (error) {
+          console.error(
+            `Error waiting for idle session creation for server ${serverUuid}:`,
+            error,
+          );
+        }
+      }
+    }
+
+    // No idle session available and none being created, create a new connection
     const newClient = await this.createNewConnection(params);
     if (!newClient) {
       return undefined;
@@ -138,6 +188,26 @@ export class McpServerPool {
   }
 
   /**
+   * Wait for a promise with a timeout
+   */
+  private async waitWithTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    timeoutMessage: string,
+  ): Promise<T> {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(timeoutMessage));
+      }, timeoutMs);
+      
+      // Cleanup the timer if the promise resolves first
+      promise.then(() => clearTimeout(timer)).catch(() => clearTimeout(timer));
+    });
+
+    return Promise.race([promise, timeoutPromise]);
+  }
+
+  /**
    * Create an idle session for a server asynchronously (non-blocking)
    */
   private createIdleSessionAsync(
@@ -155,14 +225,15 @@ export class McpServerPool {
     // Mark that we're creating an idle session for this server
     this.creatingIdleSessions.add(serverUuid);
 
-    // Create the session in the background (fire and forget)
-    this.createNewConnection(params)
+    // Create the session promise and store it
+    const creationPromise = this.createNewConnection(params)
       .then((newClient) => {
         if (newClient && !this.idleSessions[serverUuid]) {
           this.idleSessions[serverUuid] = newClient;
           console.log(
             `Created background idle session for server [${params.name}] ${serverUuid}`,
           );
+          return newClient;
         } else if (newClient) {
           // We already have an idle session, cleanup the extra one
           newClient.cleanup().catch((error) => {
@@ -172,17 +243,23 @@ export class McpServerPool {
             );
           });
         }
+        return undefined;
       })
       .catch((error) => {
         console.error(
           `Error creating background idle session for ${serverUuid}:`,
           error,
         );
+        return undefined;
       })
       .finally(() => {
-        // Remove from creating set
+        // Remove from creating set and promise map
         this.creatingIdleSessions.delete(serverUuid);
+        this.creatingSessionPromises.delete(serverUuid);
       });
+
+    // Store the promise so other requests can wait for it
+    this.creatingSessionPromises.set(serverUuid, creationPromise);
   }
 
   /**
@@ -200,6 +277,47 @@ export class McpServerPool {
     );
 
     await Promise.allSettled(promises);
+  }
+
+  /**
+   * Warmup the pool by pre-creating idle sessions for all servers in a namespace
+   * This helps avoid the race condition where initial requests get empty tool lists
+   */
+  async warmupNamespace(
+    serverParams: Record<string, ServerParameters>,
+  ): Promise<void> {
+    console.log(
+      `Starting warmup for namespace with ${Object.keys(serverParams).length} servers`,
+    );
+    
+    const startTime = Date.now();
+    const promises = Object.entries(serverParams).map(
+      async ([uuid, params]) => {
+        // Check if we already have an idle session or are creating one
+        if (this.idleSessions[uuid] || this.creatingIdleSessions.has(uuid)) {
+          return;
+        }
+
+        try {
+          // Create idle session synchronously for warmup
+          await this.createIdleSession(uuid, params);
+        } catch (error) {
+          console.error(
+            `Failed to warmup server ${uuid} (${params.name}):`,
+            error,
+          );
+        }
+      },
+    );
+
+    const results = await Promise.allSettled(promises);
+    const successCount = results.filter(r => r.status === 'fulfilled').length;
+    const failCount = results.filter(r => r.status === 'rejected').length;
+    const duration = Date.now() - startTime;
+    
+    console.log(
+      `Namespace warmup completed in ${duration}ms: ${successCount} successful, ${failCount} failed`,
+    );
   }
 
   /**

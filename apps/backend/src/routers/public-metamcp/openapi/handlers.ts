@@ -33,6 +33,16 @@ export const createOriginalListToolsHandler = (
     );
     const allTools: Tool[] = [];
 
+    // Warmup the namespace to pre-create idle sessions and reduce race conditions
+    try {
+      await mcpServerPool.warmupNamespace(serverParams);
+    } catch (error) {
+      console.warn(
+        `OpenAPI warmup failed for namespace ${context.namespaceUuid}, continuing without warmup:`,
+        error,
+      );
+    }
+
     await Promise.allSettled(
       Object.entries(serverParams).map(async ([mcpServerUuid, params]) => {
         const session = await mcpServerPool.getSession(

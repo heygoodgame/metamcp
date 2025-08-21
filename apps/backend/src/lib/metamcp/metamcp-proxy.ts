@@ -96,6 +96,16 @@ export const createServer = async (
     );
     const allTools: Tool[] = [];
 
+    // Warmup the namespace to pre-create idle sessions and reduce race conditions
+    try {
+      await mcpServerPool.warmupNamespace(serverParams);
+    } catch (error) {
+      console.warn(
+        `Warmup failed for namespace ${context.namespaceUuid}, continuing without warmup:`,
+        error,
+      );
+    }
+
     // We'll filter servers during processing after getting sessions to check actual MCP server names
     const allServerEntries = Object.entries(serverParams);
 
